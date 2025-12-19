@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Archery Auto Tracker</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+
+    <style>
+        body { margin: 0; background: #000; font-family: -apple-system, sans-serif; overflow: hidden; color: white; }
+        #container { position: relative; width: 100vw; height: 100vh; }
+        video, canvas { position: absolute; width: 100%; height: 100%; object-fit: cover; }
+        .mirror { transform: scaleX(-1); } /* 鏡像控制 */
+
+        .overlay {
+            position: absolute; top: 20px; left: 20px; right: 20px;
+            display: flex; justify-content: space-between; pointer-events: none;
+        }
+        .status-card {
+            background: rgba(0,0,0,0.7); padding: 15px; border-radius: 12px;
+            border-left: 5px solid #fff; min-width: 120px;
+        }
+        .recording-on { border-left-color: #ff4757; animation: blink 1s infinite; }
+        
+        .controls {
+            position: absolute; bottom: 40px; width: 100%;
+            display: flex; justify-content: center; gap: 20px;
+        }
+        button {
+            padding: 15px 25px; border-radius: 30px; border: none; 
+            font-size: 16px; font-weight: bold; cursor: pointer;
+            background: rgba(255,255,255,0.2); color: white; backdrop-filter: blur(10px);
+        }
+        #exportBtn { background: #2ed573; color: black; }
+
+        @keyframes blink { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
+    </style>
+</head>
+<body>
+
+<div id="container">
+    <video id="input_video" playsinline></video>
+    <canvas id="output_canvas"></canvas>
+
+    <div class="overlay">
+        <div id="status_box" class="status-card">
+            狀態: <span id="state_text">等待 Setup...</span><br>
+            記錄點: <span id="point_count">0</span>
+        </div>
+    </div>
+
+    <div class="controls">
+        <button id="switchBtn"><i class="fas fa-camera-retro"></i></button>
+        <button id="clearBtn"><i class="fas fa-trash-alt"></i></button>
+        <!-- <button id="exportBtn">導出 CSV</button> -->
+    </div>
+</div>
+
+<script>
+const videoElement = document.getElementById('input_video');
+const canvasElement = document.getElementById('output_canvas');
+const canvasCtx = canvasElement.getContext('2d');
+const stateText = document.getElementById('state_text');
+const statusBox = document.getElementById('status_box');
+
+let elbowPath = [];
+let isRecording = false;
+let setupStartTime = null;
+let currentFacingMode = 'user'; // 'user' 或 'environment'
+let camera = null;
+let isInCooldown = false; // 新增：冷卻狀態標誌
+let cooldownStartTime = null; // 新增：冷卻開始時間
+
+// 初始化 Pose
+const pose = new Pose({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+});
+pose.setOptions({ modelComplexity: 1, smoothLandmarks: true, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
+
+// 新增：開始冷卻計時
+function startCooldown() {
+  isInCooldown = true;
+  cooldownStartTime = Date.now();
+  stateText.innerText = "已完成 Release，冷卻5秒...";
+}
+
+function onResults(results) {
+  canvasElement.width = videoElement.videoWidth;
+  canvasElement.height = videoElement.videoHeight;
+  canvasCtx.save();
+  canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+  canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+  // 檢查冷卻狀態
+  if (isInCooldown) {
+    const cooldownRemaining = Math.max(0, 5 - (Date.now() - cooldownStartTime) / 1000);
+    if (cooldownRemaining > 0) {
+      stateText.innerText = `冷卻中... (${cooldownRemaining.toFixed(1)}s)`;
+    //   return; // 冷卻期間跳過所有處理
+    } else {
+      isInCooldown = false;
+      cooldownStartTime = null;
+    }
+  }
+
+  if (results.poseLandmarks) {
+    const elbow = results.poseLandmarks[14];  // 右手肘
+    const shoulder = results.poseLandmarks[12]; // 右肩
+    const ear = results.poseLandmarks[8];      // 右耳
+    const wrist = results.poseLandmarks[16] //右手腕
+    const hip = results.poseLandmarks[24] //右hip
+    const half_sh = shoulder.y + shoulder.y/10
+
+    // --- 自動化邏輯 ---
+    
+    // 偵測 Setup (手肘高於肩膀)
+    if (elbow.y < shoulder.y) {
+        if (!isRecording && !isInCooldown) {  // 只在非記錄狀態檢查準備
+            if (!setupStartTime) setupStartTime = Date.now();
+            const duration = (Date.now() - setupStartTime) / 1000;
+            
+            stateText.innerText = `準備中 (${duration.toFixed(1)}s)`;
+            
+            if (duration >= 0.2) { // 持續0.2秒後開始記錄
+                isRecording = true;
+                elbowPath = []; // 只在開始記錄時清空
+                setupStartTime = null; // 重置準備計時
+                statusBox.classList.add('recording-on');
+                stateText.innerText = "正在記錄路徑...";
+            }
+        }
+    } else if (elbow.y > half_sh) { //(手肘低於hip和肩的中間)
+        // 手肘低於肩膀時重置準備計時
+        if (!isRecording && !isInCooldown) {
+            setupStartTime = null;
+            stateText.innerText = "等待 Setup...";
+        }
+    } 
+
+    // 記錄路徑
+    if (isRecording && !isInCooldown) {
+        elbowPath.push({
+            x: elbow.x * canvasElement.width,
+            y: elbow.y * canvasElement.height,
+            z: elbow.z,
+            t: Date.now()
+        });
+        document.getElementById('point_count').innerText = elbowPath.length;
+        
+        // 修正 Release 條件
+        // 使用相對閾值，例如：手肘低於肩膀超過閾值
+        const releaseThreshold = 0.01; // x% 的相對位置差
+        // const isReleased = elbow.y > shoulder.y + releaseThreshold;
+        const isReleased = wrist.x < shoulder.x + releaseThreshold;
+        
+        // 或者使用絕對像素距離
+        // const pixelThreshold = 20;
+        // const isReleased = elbow.y * canvasElement.height > shoulder.y * canvasElement.height + pixelThreshold;
+        
+        if (isReleased && elbowPath.length > 10 && !isInCooldown) { // 增加最小點數要求
+            isRecording = false;
+            setupStartTime = null;
+            statusBox.classList.remove('recording-on');
+            stateText.innerText = "已完成 Release";
+            startCooldown();
+            
+            // 可以考慮在這裡觸發分析或儲存路徑
+        }
+    }
+
+    // --- 繪製 ---
+    // 顯示 ear(藍)、elbow(紅)、wrist(綠) 三點
+    const landmarksToDraw = [
+        { x: elbow.x, y: elbow.y, color: '#FF4757' },  // 手肘 紅
+        // ...(ear ? [{ x: ear.x, y: ear.y, color: '#3742FA' }] : []),     // 耳朵 藍
+        ...(wrist ? [{ x: wrist.x, y: wrist.y, color: '#2ED573' }] : []) // 手腕 綠
+    ];
+
+    drawLandmarks(canvasCtx, landmarksToDraw, {lineWidth: 2, radius: 6});
+
+    // 繪製綠色路徑線 
+    if (elbowPath.length > 1) {
+    // if (isRecording) {
+        canvasCtx.beginPath();
+        canvasCtx.strokeStyle = '#2ed573';
+        canvasCtx.lineWidth = 5;
+        canvasCtx.lineJoin = 'round';
+        canvasCtx.moveTo(elbowPath[0].x, elbowPath[0].y);
+        elbowPath.forEach(p => canvasCtx.lineTo(p.x, p.y));
+        canvasCtx.stroke();
+    }
+  }
+  canvasCtx.restore();
+}
+
+pose.onResults(onResults);
+
+// 相機控制
+function startCamera() {
+    if (camera) camera.stop();
+    
+    // 根據模式決定是否需要 CSS 鏡像
+    if (currentFacingMode === 'user') {
+        videoElement.classList.add('mirror');
+        canvasElement.classList.add('mirror');
+    } else {
+        videoElement.classList.remove('mirror');
+        canvasElement.classList.remove('mirror');
+    }
+
+    camera = new Camera(videoElement, {
+        onFrame: async () => { await pose.send({image: videoElement}); },
+        width: 1280, height: 720,
+        facingMode: currentFacingMode
+    });
+    camera.start();
+}
+
+
+// 按鈕事件
+document.getElementById('switchBtn').onclick = () => {
+    currentFacingMode = (currentFacingMode === 'user') ? 'environment' : 'user';
+    startCamera();
+};
+
+document.getElementById('clearBtn').onclick = () => {
+    elbowPath = [];
+    document.getElementById('point_count').innerText = "0";
+    stateText.innerText = "等待 Setup...";
+};
+
+// document.getElementById('exportBtn').onclick = () => {
+//     if (elbowPath.length === 0) return alert("無數據");
+//     let csv = "Time,X,Y,Z\n" + elbowPath.map(p => `${p.t},${p.x},${p.y},${p.z}`).join("\n");
+//     const blob = new Blob([csv], { type: 'text/csv' });
+//     const url = URL.createObjectURL(blob);
+//     const a = document.createElement('a');
+//     a.href = url;
+//     a.download = `archery_elbow_${Date.now()}.csv`;
+//     a.click();
+// };
+
+startCamera();
+</script>
+</body>
+</html>
